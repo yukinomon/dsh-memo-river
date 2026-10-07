@@ -83,8 +83,18 @@
               name: '@dsh-external/dsh-memo-river'
               config:
                 workspaceScoped: true
+                # 固定桶名（2026-10-01 用户要求）：不写的话桶名会取 basename(cwd)，
+                # 于是每次启动桶名都变（日志里出现过 river-sandbox / DSH Desktop），
+                # 语料按桶名（diary_name）索引，名字一变就查不到自己的日记。
+                bucket: 'dsh'
                 intervalMs: 900000          # 守护循环 15 分钟
-                embed: { apiUrl: 'https://api.relayrouter.ai', apiKey: !!js process.env.TAG_EMBED_KEY || '', model: 'gemini-embedding-2-preview', dimension: 3072 }
+                # 嵌入通道改走 {vcpRoot}/config.env（SiliconFlow / BAAI/bge-m3 / 1024 维）：
+                #   · apiUrl / apiKey 留空 → resolveEmbed 的 pick() 回落到 config.env 的 API_URL / API_Key；
+                #   · model / dimension **必须显式写死**——config.ts 给这两项带了 schema 默认值
+                #     （gemini-embedding-2-preview / 3072），而 pick() 的判据是「config 有值就不读 env」，
+                #     默认值会把 config.env 里那两行彻底挡住。实测（2026-10-01）：不写就报
+                #     embed-http-400 "Model does not exist"，且 3072 维与库内 1024 维向量不匹配。
+                embed: { model: 'BAAI/bge-m3', dimension: 1024 }
                 inject:
                   gate: true
                   k: 3
@@ -118,7 +128,7 @@
                   # 8000 给离群（实测见过 9.2s / 12.6s）留出余量，同时仍有硬顶，
                   # 不退回「吞掉整轮交互预算」的老问题。
                   embedTimeoutMs: 8000
-                native: { vcpRoot: '/home/h/app/VCPToolBox' }
+                native: { vcpRoot: 'D:/scratch/vcp-v3-research/.upstream/VCPToolBox' }
 
         # ── shell ───────────────────────────────────────────────────────────────────
 
@@ -341,7 +351,3 @@
         - id: present
           name: '@deepseek-ai/dsh-tool-present'
 
-# ── GUI 调参面板（client 半面，常驻 entry）──────────────────────────────
-- insert:
-    - id: dsh-memo-tuner
-      name: '@dsh-external/dsh-memo-tuner'

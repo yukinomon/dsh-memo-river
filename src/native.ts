@@ -10,7 +10,8 @@
  * 一切向量/图/读出计算都在 Rust；本模块只做索引装载与载荷组装。
  */
 import { createRequire } from 'node:module'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { KnowledgeStore } from './store.js'
@@ -156,6 +157,106 @@ export function pipelineConfig(kbm: Record<string, unknown>): Record<string, unk
     langPenaltyCrossDomain: num(lang.penaltyCrossDomain, 0.1),
     deduplicationThreshold: num(kbm.deduplicationThreshold, 0.88),
   }
+}
+
+/* ────────────── Topology V3 配置桥（对齐上游 RiverMemoEngine._nativeConfig:61-134） ────────────── */
+
+/**
+ * 标定覆写文件（calibrate-anchor.mjs 写入；缺失=直接回退默认值）。
+ * 用 statSync 比对 mtime，标定后改文件无需重启。仅白名单键生效，其余键视为元数据。
+ */
+const TUNING_PATH = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'memo-river', 'topology-tuning.json')
+const TUNABLE_KEYS = ['anchorBonusCap'] as const
+let tuningCache: { sig: string; cfg: Record<string, number> } | null = null
+
+function loadTuning(): Record<string, number> {
+  try {
+    const st = statSync(TUNING_PATH)
+    const sig = `${st.mtimeMs}:${st.size}`
+    if (tuningCache?.sig === sig) return tuningCache.cfg
+    const raw = JSON.parse(readFileSync(TUNING_PATH, 'utf8')) as Record<string, unknown>
+    const cfg: Record<string, number> = {}
+    for (const k of TUNABLE_KEYS) {
+      const v = raw[k]
+      if (typeof v === 'number' && Number.isFinite(v) && v >= 0) cfg[k] = v
+    }
+    tuningCache = { sig, cfg }
+    return cfg
+  } catch {
+    return tuningCache?.cfg ?? {}
+  }
+}
+
+/**
+ * 60 条标定值（2026-10-02，见 attribution-6layer / sweep-anchor）：上游默认 0.1 相对
+ * 语义分差超重 3~10 倍（R@1 63.3），0.02 为最优平台（76.7）。上游 topologyV3AnchorBonusCap
+ * 不直接生效，只能经标定文件或 RIVER_ANCHOR_CAP 覆写——防止上游原值把已验证修复冲掉。
+ */
+const ANCHOR_CAP_CALIBRATED = 0.02
+
+/** 上游 section → Rust NativeConfig 字段映射；只发显式存在的数值字段，其余走 Rust 编译默认。 */
+export function topologyV3Config(kbm: Record<string, unknown>): Record<string, number> {
+  const rm = bag(kbm.riverMemo)
+  const candidate = bag(rm.candidateSuperset)
+  const path = bag(rm.pathGeometry)
+  const relative = bag(rm.relativeTopology)
+  const omega = bag(rm.riverObservability)
+  const anchor = bag(rm.directAnchor)
+  const dstc = bag(rm.dstc)
+  const cfg: Record<string, number> = {}
+  const put = (key: string, v: unknown) => {
+    if (typeof v === 'number' && Number.isFinite(v)) cfg[key] = v
+  }
+  put('queryK', candidate.queryK)
+  put('denoisedK', candidate.denoisedK ?? candidate.queryK)
+  put('localFieldK', candidate.localFieldK)
+  put('transferFieldK', candidate.transferFieldK)
+  put('bm25K', candidate.bm25K)
+  put('anchorK', candidate.anchorK)
+  put('maxUnionCandidates', candidate.maxUnionCandidates)
+  put('localWeight', path.localWeight)
+  put('transferWeight', path.transferWeight)
+  put('directionFloor', path.directionFloor)
+  put('closureFloor', path.closureFloor)
+  put('semanticNodeThreshold', relative.semanticNodeThreshold)
+  put('relativeDistanceTemperature', relative.relativeDistanceTemperature)
+  put('reverseDirectionCredit', relative.reverseDirectionCredit)
+  put('minimumRiverEdgeFlow', relative.minimumRiverEdgeFlow)
+  put('maximumRiverEdges', relative.maximumRiverEdges)
+  put('nodeOnlyReliabilityCap', relative.nodeOnlyReliabilityCap)
+  put('kappaEdge', omega.kappaEdge)
+  put('kappaRatio', omega.kappaRatio)
+  put('omegaEpsilon', omega.epsilon)
+  put('collapsedThreshold', omega.collapsedThreshold)
+  put('sparseThreshold', omega.sparseThreshold)
+  put('semanticAnchorThreshold', anchor.semanticThreshold)
+  put('semanticAnchorDiscount', anchor.semanticDiscount)
+  put('specificityFloor', anchor.specificityFloor)
+  put('rarityFloor', anchor.rarityFloor)
+  put('reliabilitySeedSaturation', anchor.reliabilitySeedSaturation)
+  put('fallbackReliabilityCap', anchor.fallbackReliabilityCap)
+  put('topologyBonusCap', dstc.topologyBonusCap)
+  put('topologyPathSaturation', dstc.topologyPathSaturation)
+  put('conditionalBandwidth', dstc.topologyV2ConditionalBandwidth)
+  put('conditionalClosureBandwidth', dstc.topologyV2ClosureBandwidth)
+  put('conditionalDirectBandwidth', dstc.topologyV2DirectBandwidth)
+  put('minimumPeers', dstc.topologyV2MinimumPeers)
+  put('minimumEffectivePeers', dstc.topologyV2MinimumEffectivePeers)
+  put('innovationConfidenceZ', dstc.topologyV2InnovationConfidenceZ)
+  put('innovationScale', dstc.topologyV2InnovationScale)
+  put('omegaGamma', dstc.topologyV3OmegaGamma)
+  put('structRoleMinOmega', dstc.topologyV3StructRoleMinOmega)
+  put('anchorActivationZ', dstc.topologyV3AnchorActivationZ)
+  put('anchorActivationFloor', dstc.topologyV3AnchorActivationFloor)
+  put('anchorSaturation', dstc.topologyV3AnchorSaturation)
+  put('anchorFrontierContrast', dstc.topologyV3AnchorFrontierContrast)
+  put('anchorFrontierAbsFloor', dstc.topologyV3AnchorFrontierAbsFloor)
+  const envCap = Number(process.env.RIVER_ANCHOR_CAP)
+  cfg.anchorBonusCap =
+    Number.isFinite(envCap) && envCap >= 0
+      ? envCap
+      : loadTuning().anchorBonusCap ?? ANCHOR_CAP_CALIBRATED
+  return cfg
 }
 
 /* ────────────── 引擎 ────────────── */
@@ -537,6 +638,9 @@ export class MemoEngine {
             dimension: this.options.dimension,
             topK: candidates.length,
             includeTrace: true,
+            // 配置桥：rag_params.json（knowledgeBaseManager.riverMemo.*）→ Rust NativeConfig，
+            // 对齐上游 RiverMemoEngine._nativeConfig；锚上限另走 env/标定文件/标定值三级。
+            config: topologyV3Config(this.kbm),
             // 生产形状见 KnowledgeBaseManager.js:1664：重数据留在 Rust（observationHandle），
             // JS 侧只递空占位场 + 查询几何状态。
             query: { text: queryText, vector: [] },

@@ -41,16 +41,40 @@ const CWD = args.get('cwd') || new URL('../.selftest/classroom', import.meta.url
 const BUCKET = args.get('bucket') || basename(SRC)
 const FORCE = flags.has('force')
 
-/** 解析 schemastery Config 的默认值（与插件运行时同一份 schema）。 */
+/** 解析 schemastery Config 的默认值（与插件运行时同一份 schema）。
+ *
+ * ⚠️ vcpRoot 原来硬编码 Linux 路径 `/home/h/app/VCPToolBox`，在别的机器上必然
+ *    `resolveEmbed` 返回 source=none（本机 2026-10-01 实测）。改为可覆盖。
+ *
+ * ⚠️ model / dimension 的 schema **带非空默认值**（gemini-embedding-2-preview / 3072），
+ *    而 `resolveEmbed` 的 pick() 判据是「config 有值就不读 env」——默认值会把 config.env 里的
+ *    `WhitelistEmbeddingModel` / `VECTORDB_DIMENSION` 彻底挡住（apiUrl/apiKey 默认是空串所以能回落）。
+ *    因此要用 config.env 里的模型时，必须显式传 --model / --dimension。 */
+const VCP_ROOT = args.get('vcp-root') || process.env.VCP_ROOT || '/home/h/app/VCPToolBox'
+const MODEL = args.get('model')
+const DIMENSION = args.get('dimension') ? Number(args.get('dimension')) : undefined
+
+const embedOverride = {}
 /* 提速资产（0916）：EMBED_STUB_URL 环境变量 → 走本地嵌入桩（setup-selftest 快循环用）。 */
-const config = ConfigSchema({ bucket: BUCKET, native: { vcpRoot: '/home/h/app/VCPToolBox' }, ...(process.env.EMBED_STUB_URL ? { embed: { apiUrl: process.env.EMBED_STUB_URL, apiKey: 'stub' } } : {}) })
+if (process.env.EMBED_STUB_URL) {
+  embedOverride.apiUrl = process.env.EMBED_STUB_URL
+  embedOverride.apiKey = 'stub'
+}
+if (MODEL) embedOverride.model = MODEL
+if (DIMENSION) embedOverride.dimension = DIMENSION
+const config = ConfigSchema({
+  bucket: BUCKET,
+  native: { vcpRoot: VCP_ROOT },
+  ...(Object.keys(embedOverride).length ? { embed: embedOverride } : {}),
+})
 
 const paths = workspacePaths(CWD, BUCKET)
 ensureWorkspaceDirs(paths)
 const logger = new Logger(paths.logPath)
 const resolved = resolveEmbed(config, paths)
 if (resolved.source === 'none') {
-  console.error('❌ 嵌入未配置：检查 /home/h/app/VCPToolBox/config.env 的 API_URL / API_Key')
+  const envPath = config.native.configEnv || `${VCP_ROOT}/config.env`
+  console.error(`❌ 嵌入未配置：检查 ${envPath} 的 API_URL / API_Key（或传 --vcp-root 指定 VCPToolBox 目录）`)
   process.exit(1)
 }
 console.log(`工作区: ${paths.root}`)
@@ -68,7 +92,7 @@ const embed = new EmbedClient({
 })
 
 const files = readdirSync(SRC)
-  .filter((f) => f.endsWith('.txt'))
+  .filter((f) => f.endsWith('.txt') || f.endsWith('.md'))
   .sort()
 
 if (!FORCE && store.files(BUCKET).length >= files.length) {
