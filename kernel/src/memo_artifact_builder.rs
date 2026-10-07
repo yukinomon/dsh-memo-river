@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PAYLOAD_SCHEMA: &str = "rivermemo-persisted-artifact-v2";
@@ -95,7 +95,7 @@ fn open_readonly(path: &str) -> std::result::Result<Connection, String> {
     Ok(connection)
 }
 
-fn open_readwrite(path: &str) -> std::result::Result<Connection, String> {
+fn open_readwrite_inner(path: &str) -> std::result::Result<Connection, String> {
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
         .map_err(|error| format!("open readwrite SQLite failed: {}", error))?;
     connection
@@ -107,8 +107,59 @@ fn open_readwrite(path: &str) -> std::result::Result<Connection, String> {
     connection
         .pragma_update(None, "synchronous", "NORMAL")
         .map_err(|error| format!("configure SQLite synchronous failed: {}", error))?;
-    // 上游此处调用 ensure_sqlite_keepalive（WAL 双开防护）。复刻 v1 差分跑在一次性
-    // 副本库上、进程退出即弃，keepalive 生态随票 10（runtime 复刻）进场。
+    Ok(connection)
+}
+
+/* ── WAL 双开防护（BUG-0930，2026-10-03 自上游 lib.rs ensure_sqlite_keepalive 移植）──
+ * 背景：同进程内 node:sqlite（store 长连接）与本库是两份独立编译的 sqlite 实例，
+ * POSIX 锁按进程计、互相不可见。若无永生连接，每次构建的连接 close 时从本实例
+ * 视角判定"最后一个连接"→ checkpoint/重置 WAL → node 侧未 checkpoint 的提交行
+ * 在下一次进程边界被静默丢弃（genshin-ts 桶 9 篇日记回卷事故，已沙箱复现）。
+ * 每 dbPath 保留一条永不关闭的 readwrite 连接，使"最后一个连接"判定永不成立。
+ * 原复刻 v1 省略此处（差分跑在一次性副本库上安全）；生产切轨 eacf947 后暴露。 */
+static SQLITE_KEEPALIVES: LazyLock<Mutex<HashMap<String, Connection>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn normalized_sqlite_path(db_path: &str) -> String {
+    std::path::Path::new(db_path)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(db_path))
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_lowercase()
+}
+
+fn ensure_sqlite_keepalive(db_path: &str) {
+    let key = normalized_sqlite_path(db_path);
+    let mut guard = SQLITE_KEEPALIVES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.contains_key(&key) {
+        return;
+    }
+    let opened = open_readwrite_inner(db_path).and_then(|keepalive| {
+        keepalive
+            .query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+            .map_err(|error| format!("keepalive probe failed: {}", error))?;
+        Ok(keepalive)
+    });
+    match opened {
+        Ok(keepalive) => {
+            eprintln!("[memo-kernel] 🛡️ SQLite keepalive retained for {}", key);
+            guard.insert(key.clone(), keepalive);
+        }
+        Err(error) => {
+            eprintln!(
+                "[memo-kernel] ❌ SQLite keepalive unavailable for {}; retrying later: {}",
+                key, error
+            );
+        }
+    }
+}
+
+fn open_readwrite(path: &str) -> std::result::Result<Connection, String> {
+    let connection = open_readwrite_inner(path)?;
+    ensure_sqlite_keepalive(path);
     Ok(connection)
 }
 

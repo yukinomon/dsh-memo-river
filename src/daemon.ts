@@ -53,6 +53,11 @@ export class WorkspaceDaemon {
   private lastArtifactSig: string | null = null
   /** 票⑥B：artifact 行换代清理的上次执行时刻（0=下轮即执行）。 */
   private lastArtifactGcAt = 0
+  /** BUG-0930 回卷 tripwire：上轮 files 行数。memo_delete/merge 也会降，但单轮
+   *  无删除操作的净下降 = WAL 回卷信号（genshin-ts 桶 9 篇静默丢失事故）。
+   *  保守起见只告警不阻断——真实删除（memo_discard 后 memo_merge 退役）由
+   *  当轮 mergeCandidates 上下文佐证，人工判读。 */
+  private lastFilesCount: number | null = null
   private timer: (() => void) | null = null
   private running = false
 
@@ -160,6 +165,15 @@ export class WorkspaceDaemon {
         /* 体检日志写失败静默 */
       }
       for (const w of report.warnings) log('warn', `guardian-health: ${w}`)
+
+      /* ③b BUG-0930 回卷 tripwire：files 行数净下降 → 高声告警（WAL 回卷/静默删行信号）。 */
+      if (this.lastFilesCount !== null && report.counts.files < this.lastFilesCount) {
+        log('warn', `guardian-rollback-tripwire: files ${this.lastFilesCount}→${report.counts.files} 净下降（本轮无删除操作时=WAL 回卷信号，检查最近进程重启与 -wal 状态）`)
+        try {
+          appendFileSync(workspace.paths.healthLogPath, `[${new Date(at).toISOString()}] ROLLBACK-TRIPWIRE files=${this.lastFilesCount}→${report.counts.files}\n`)
+        } catch { /* 静默 */ }
+      }
+      this.lastFilesCount = report.counts.files
 
       /* ③ 草稿落盘（等确认，不自动入库） */
       if (this.options.config.maintenance.drafts) {

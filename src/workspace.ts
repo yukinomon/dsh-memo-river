@@ -276,6 +276,44 @@ export function resolveEmbed(config: Config, paths: WorkspacePaths): ResolvedEmb
 
 const registry = new Map<string, WorkspaceRuntime>()
 
+/**
+ * 挂载级引用计数（BUG-1003 票14）：registry 本身按桶数有界，这里收口是为了
+ * 挂载代际（?v= churn / fiber dispose）后尽快归还 sqlite fd 与引擎资源。
+ * retain/release 只在挂载边界配对（daemonFor ↔ 守护收口 effect）；逐工具调用
+ * 不计数——调用是瞬态复用，计入会破坏配对不变量（调完无人 release）。
+ */
+const mountRefs = new Map<string, { count: number; closeTimer?: ReturnType<typeof setTimeout> }>()
+
+export function retainWorkspace(key: string): void {
+  const entry = mountRefs.get(key) ?? { count: 0 }
+  entry.count += 1
+  if (entry.closeTimer) {
+    clearTimeout(entry.closeTimer)
+    entry.closeTimer = undefined
+  }
+  mountRefs.set(key, entry)
+}
+
+export function releaseWorkspace(key: string, graceMs = 30_000): void {
+  const entry = mountRefs.get(key)
+  if (!entry || entry.count <= 0) return
+  entry.count -= 1
+  if (entry.count > 0) return
+  /* 宽限关闭：等瞬态调用（注入尾巴/守护 tick）自然收尾；期间新挂载可撤销。 */
+  entry.closeTimer = setTimeout(() => {
+    mountRefs.delete(key)
+    const runtime = registry.get(key)
+    if (!runtime) return
+    registry.delete(key)
+    try {
+      runtime.close()
+    } catch {
+      /* 单桶收口失败不阻塞其余 */
+    }
+  }, graceMs)
+  entry.closeTimer.unref?.()
+}
+
 export function acquireWorkspace(cwd: string, config: Config): WorkspaceRuntime {
   const key = workspaceHash(cwd)
   const existing = registry.get(key)

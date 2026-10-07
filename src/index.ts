@@ -18,7 +18,7 @@ import { Logger, dshHome } from './runtime.js'
 import { getSession, takeDrafts, dropSession, listSessions, SUBSTANTIVE_REPORT_CHARS, type PendingDraft } from './session.js'
 import { applyPresetTuning, handleActiveProbe, handleTuningApi, serveTuningPanel, dropSessionTuning, tuningDefaults as tuningDefaultsOf } from './tuning.js'
 import { installTools } from './tools.js'
-import { acquireWorkspace, type WorkspaceRuntime } from './workspace.js'
+import { acquireWorkspace, releaseWorkspace, retainWorkspace, type WorkspaceRuntime } from './workspace.js'
 import { join } from 'node:path'
 import { mkdirSync } from 'node:fs'
 
@@ -285,14 +285,29 @@ export function apply(ctx: AppContext, config: MemoRiverConfig): void {
         }
       }
       daemons.clear()
+      /* BUG-1003 票14：守护收口时归还本挂载代持有的工作区引用；
+       * refs 归零后 30s 宽限关闭（瞬态尾巴收完、新挂载可撤销）。 */
+      for (const key of heldWorkspaceKeys) {
+        try {
+          releaseWorkspace(key)
+        } catch {
+          /* 同上：静默 */
+        }
+      }
+      heldWorkspaceKeys.clear()
     },
     'memo-river: guardian timers',
   )
+
+  /* 票14：本挂载代 retain 过的桶键（收口时逐个 release，与 daemons Map 同生命周期）。 */
+  const heldWorkspaceKeys = new Set<string>()
 
   const daemonFor = (workspace: WorkspaceRuntime): WorkspaceDaemon => {
     const key = workspace.paths.hash
     const existing = daemons.get(key)
     if (existing) return existing
+    retainWorkspace(key)
+    heldWorkspaceKeys.add(key)
     const daemon = new WorkspaceDaemon({
       config,
       workspace,
