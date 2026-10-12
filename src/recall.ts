@@ -209,6 +209,25 @@ function titleOf(p: string): string {
 }
 
 /**
+ * D161：候选域上限——candidateSuperset.maxUnionCandidates（上游生产口径）。
+ *
+ * 取值路径：MemoEngine.kbm 是 TS private 且无公开访问器（native.ts:403），本单边界
+ * 禁改 native.ts/config.ts，故运行时经类型擦除直读同一 kbm 对象——与配置桥
+ * `put('maxUnionCandidates', candidate.maxUnionCandidates)`（native.ts:299）同源同路径，
+ * 值来自 rag_params.json（本机实测 300）。缺配置/非正数 → 0 = 不截断（旧行为），
+ * 绝不写死 300 字面量。
+ */
+function maxUnionCandidatesOf(engine: MemoEngine): number {
+  const kbm = (engine as unknown as { kbm?: Record<string, unknown> }).kbm
+  const rm = kbm?.riverMemo
+  const cs = rm && typeof rm === 'object' ? (rm as Record<string, unknown>).candidateSuperset : null
+  const raw = cs && typeof cs === 'object' ? (cs as Record<string, unknown>).maxUnionCandidates : null
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return 0
+  const n = Math.floor(raw)
+  return n > 0 ? n : 0
+}
+
+/**
  * 构造查询场文本（DESIGN §4 ①「取本会话最近 N 条消息 → 构造查询场」）。
  * 从最近往回收，累计到 lookback 条；空消息跳过。
  */
@@ -438,6 +457,13 @@ export async function recall(
   const knnById = new Map(knn.map((c) => [c.id, c.score]))
   const retrievalMaxKnn = knn[0]?.score ?? 0
 
+  /* D161：候选域截断——递入读出前把全库 KNN 截到 maxUnionCandidates（上游生产口径
+   * truncate(300)，rivermemo_topology_v3.rs:1170-1267）。截断只作用于**递入域**：
+   * knn/knnById/retrievalMaxKnn 保持全量，门控与低基数门限语义零漂移，读出若回传
+   * 域外 id 也不会把 knnScore 误判为 0。配置缺失 → 不截断（旧行为）。 */
+  const maxUnionCandidates = maxUnionCandidatesOf(engine)
+  const candidatePool = maxUnionCandidates > 0 ? knn.slice(0, maxUnionCandidates) : knn
+
   /* ①b 门控判定（与检索窗口解耦）
    *
    * 为什么必须解耦：检索向量是窗口拼接，拼接越长越靠近语料质心，任何查询的 maxKnn 都被抬高。
@@ -532,7 +558,7 @@ export async function recall(
         return { meta: pipe.metadata, readout: {}, elapsedMs: pipe.elapsedMs, missingHandle: true }
       }
 
-      const cands = knn.map((c) => ({ id: c.id, score: c.score }))
+      const cands = candidatePool.map((c) => ({ id: c.id, score: c.score }))
       let out: Record<string, unknown> = {}
       if (options.mode === 'dtsc' || options.mode === 'topology_v3' || options.mode === 'rivermemo') {
         out =
@@ -549,7 +575,7 @@ export async function recall(
     readout = observed.readout
     pipelineElapsedMs = observed.elapsedMs
 
-    const candidates = knn.map((c) => ({ id: c.id, score: c.score }))
+    const candidates = candidatePool.map((c) => ({ id: c.id, score: c.score }))
     const results: Array<Record<string, unknown>> = Array.isArray(readout.results)
       ? (readout.results as Array<Record<string, unknown>>)
       : []
@@ -702,6 +728,10 @@ export async function recall(
         kEff,
         kBase,
         adaptivePool: poolSize,
+        // D161：候选域截断留痕（candidateDomain=截后递入数；full=全库 KNN 数；max=配置上限，0=未截断）
+        candidateDomain: candidatePool.length,
+        candidateDomainFull: knn.length,
+        candidateDomainMax: maxUnionCandidates,
         // 票 04：权重执行留痕（on/recencyBoosted/exposurePenalized/maxPenalty/tagDemotions）
         selectionWeights: selection.weights,
         readoutDiagnostics: readout.diagnostics ?? null,

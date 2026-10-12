@@ -696,7 +696,20 @@ function delegationExtrasFor(agent: unknown, wstate: SessionState, suggested: st
   }
 }
 
-export function installInjection(
+/**
+ * 注册**写侧观测** seam（2B-2a 从 installInjection 拆出）。
+ *
+ * 职责（全部独立于读侧注入）：
+ *   · pre-step：扫 memo_write 工具调用 → 重置写入时钟；量 contextChars；委托闩锁；压缩计数；
+ *     evaluateWriteNudge → 结果存入 `state.pendingNudgeText`（供 installInjection 消费，或留给未来协调点）。
+ *   · llm/stream：activeMs 累计（nudge 时间锚的量尺）。
+ *
+ * **始终注册**（不受 `inject.enabled` 影响）——由 `index.ts` 的 `inject.writeObservation` 闸控制。
+ * nudge 的**消息呈现**不在此函数做（边界约束：评估结果以可读接口暴露，供后续唯一输出协调点接入）。
+ * 当 `inject.enabled: true` 时，installInjection 的 pre-step 会读 `state.pendingNudgeText` 追加 nudge 消息；
+ * 当 `inject.enabled: false` 时，nudge 仍被评估并存入 state，但不进模型请求（留给未来协调点）。
+ */
+export function installWriteObservation(
   ctx: {
     on(event: 'agent/pre-step', listener: (payload: PreStepPayload, next: () => Promise<PreStepDecision>) => Promise<PreStepDecision>, options?: { prepend?: boolean }): () => void
     on(event: 'llm/stream', listener: (options: LlmStreamOptionsLike, next: () => unknown) => unknown): () => void
@@ -705,7 +718,7 @@ export function installInjection(
 ): void {
   const { config } = deps
 
-  /* ── 主干：agent/pre-step（把注入块放到请求尾部） ── */
+  /* ── 写侧观测：agent/pre-step（memo_write 扫描 + contextChars + 委托闩锁 + 压缩计数 + nudge 评估） ── */
   ctx.on(
     'agent/pre-step',
     async (payload, next): Promise<PreStepDecision> => {
@@ -715,14 +728,10 @@ export function installInjection(
         if (!config.enabled) return decision
         if (decision.kind !== 'enter') return decision
         if (payload.signal?.aborted) return decision
-        // 写侧观测：扫到 memo_write 工具调用 → 重置写入时钟（工程识别「模型写了」，不靠承诺）。
-        // 同一遍扫描顺带量上下文字符总量（增量锚的量尺：deriveMessages 全量文本长度和）。
         const wstate = peekSession(payload.agent.session.id)
         let contextChars: number | null = null
         if (wstate) {
           const log = (payload.agent.session?.deriveMessages?.() ?? []) as unknown[]
-          // 票05：增量锚的量尺——工具输出按截尾均值封顶计入（大 dump ≠ 概念进展），
-          // 其余消息（助手正文/真实用户输入）全额计入。
           let chars = 0
           for (let i = 0; i < log.length; i++) {
             const t = messageText(log[i]).length
@@ -736,7 +745,6 @@ export function installInjection(
               wstate.toolLens.push(txt.length)
               if (wstate.toolLens.length > TOOL_LEN_SAMPLE_MAX) wstate.toolLens.shift()
             }
-            // 票05：digest 现取——记最近一条 ≥150 字助手正文的首行（自主态 nudge 的鲜弹药）。
             if ((log[i] as { role?: string }).role === 'assistant' && txt.length >= 150) {
               const firstLine = txt.split('\n').map((x) => x.trim()).find((x) => x.length > 0) ?? ''
               if (firstLine) wstate.lastAssistantDigest = firstLine.slice(0, 80)
@@ -750,10 +758,6 @@ export function installInjection(
               break
             }
           }
-          // 票05（recall-quality-0916）：委托闩锁——独立成趟（上一趟撞 memo_write 会 break，
-          // 本趟必须看全序：先写后派的批次要正确再闩上，先派后写要正确回落）。
-          // 票12：压缩计数同趟（同样需要全序；memo_write 观测即清零——进展已落盘，
-          // 「抢救被压细节」的提示窗口关闭）。
           let delegationDelta: boolean | null = null
           for (let i = from; i < log.length; i++) {
             if (hasDelegationCall(log[i])) delegationDelta = true
@@ -775,11 +779,7 @@ export function installInjection(
             wstate.activeMsAnchor = wstate.activeMs
           }
         }
-        // 读侧：注入时机（回合首发 / 自主态节律 / 压缩重注）由 buildTailInjection 全权裁定。
-        const text = await buildTailInjection(deps, payload.agent, payload.turn, payload.step, payload.messages)
-        // 写侧：写入节律提醒（独立于召回，可同拍并存；四锚：时间/汇报轮/步/增量）
-        // 票05：提醒文案带本工作区草稿队列读数（懒取——evaluateWriteNudge 确认要发才扫目录）。
-        // 票05（recall-quality-0916）：委托场景（header.delegationDepth>0 或探针闩上）→ 共享提示变体。
+        // nudge 评估（独立于召回，四锚：时间/汇报轮/步/增量）——结果存入 state，不在此追加消息。
         const delegationDepth = payload.agent.session?.header?.delegationDepth ?? 0
         const delegation = delegationDepth > 0 || (wstate?.delegationActive ?? false)
         const nudge = wstate
@@ -787,27 +787,105 @@ export function installInjection(
               try {
                 return pendingQueueStats(workspacePaths(resolveCwd(payload.agent, wstate)).pendingDir)
               } catch {
-                return null // 路径解析失败 → 提醒不带队列行，不出数字
+                return null
               }
             }, delegation, () => lastDiaryTail(deps, payload.agent, wstate), (suggested) => delegationExtrasFor(payload.agent, wstate, suggested))
           : null
-        const extra: unknown[] = []
-        if (text) extra.push(createInjectionMessage(text))
-        if (nudge) {
-          extra.push(createWriteNudgeMessage(nudge))
-          // 票01：遥测落桶日志（memo-river.log）——deps.log 是宿主 logger，生产实测两处都看不到
-          // （09-14 评估：composer 11 次投递、桶日志 0 行）。带触发理由与步号。
-          // 票05（recall-quality-0916）：补 delegation 标记（depth/闩锁双来源），变体触发可归因。
-          const delegationTag = ` delegation=${delegation ? 1 : 0}${delegation ? `(depth=${delegationDepth}${wstate?.delegationActive ? '+latch' : ''})` : ''}`
+        if (wstate) wstate.pendingNudgeText = nudge
+        // nudge 遥测落桶日志（评估触发即记，不依赖消息是否被消费）。
+        if (nudge && wstate) {
+          const delegationTag = ` delegation=${delegation ? 1 : 0}${delegation ? `(depth=${delegationDepth}${wstate.delegationActive ? '+latch' : ''})` : ''}`
           try {
             const wsLog = deps.getWorkspace(resolveCwd(payload.agent, wstate)).logger
             wsLog.info(
-              `write-nudge session=${wstate!.sessionId} turn=${payload.turn} step=${payload.step} reason=${wstate!.lastWriteNudgeReason}${delegationTag}`,
+              `write-nudge session=${wstate.sessionId} turn=${payload.turn} step=${payload.step} reason=${wstate.lastWriteNudgeReason}${delegationTag}`,
             )
           } catch {
-            deps.log('info', `write-nudge session=${wstate!.sessionId} turn=${payload.turn} reason=${wstate!.lastWriteNudgeReason}${delegationTag}`)
+            deps.log('info', `write-nudge session=${wstate.sessionId} turn=${payload.turn} reason=${wstate.lastWriteNudgeReason}${delegationTag}`)
           }
         }
+        return decision
+      } catch (e) {
+        // 写侧观测失败不阻塞主流程，也不阻塞读侧注入——各自独立降级。
+        const failMsg = `write-observation-failed: ${String((e as Error)?.stack ?? e)}`
+        deps.log('error', failMsg)
+        try {
+          const st = peekSession(payload.agent.session?.id ?? '')
+          deps.getWorkspace(resolveCwd(payload.agent, st)).logger.error(failMsg)
+        } catch {
+          /* 双落失败则只剩 deps.log 一条腿 */
+        }
+        return decision
+      }
+    },
+    { prepend: true },
+  )
+
+  /* ── llm/stream：activeMs 累计（nudge 时间锚的量尺；只量模型实际思考时间） ── */
+  ctx.on('llm/stream', (options, next) => {
+    const t0 = Date.now()
+    const accumulate = (): void => {
+      try {
+        const sid = (options as { sessionId?: string })?.sessionId
+        const st = sid ? peekSession(sid) : undefined
+        if (st) st.activeMs += Date.now() - t0
+      } catch {
+        /* 计时失败不影响主流程 */
+      }
+    }
+    try {
+      const r = next() as unknown as { then?: unknown; finally?: unknown }
+      if (r && typeof r === 'object' && typeof (r as { finally?: unknown }).finally === 'function') {
+        return (r as unknown as Promise<unknown> & { finally(cb: () => void): unknown }).finally(accumulate)
+      }
+      accumulate()
+      return r
+    } catch (e) {
+      accumulate()
+      throw e
+    }
+  })
+}
+
+/**
+ * 注册**读侧注入** seam（2B-2a 拆分后只管读侧）。
+ *
+ * 职责：
+ *   · pre-step：buildTailInjection（召回 + 门控 + 渲染）→ 追加 recall 消息；
+ *     消费 `state.pendingNudgeText`（由 installWriteObservation 设置）→ 追加 nudge 消息。
+ *   · llm/stream：验收 #1/#2 审计（system 段 hash + 注入块尾部位置）。
+ *
+ * 只在 `inject.enabled: true` 时由 `index.ts` 注册。
+ */
+export function installInjection(
+  ctx: {
+    on(event: 'agent/pre-step', listener: (payload: PreStepPayload, next: () => Promise<PreStepDecision>) => Promise<PreStepDecision>, options?: { prepend?: boolean }): () => void
+    on(event: 'llm/stream', listener: (options: LlmStreamOptionsLike, next: () => unknown) => unknown): () => void
+  },
+  deps: InjectorDeps,
+): void {
+  const { config } = deps
+
+  /* ── 主干：agent/pre-step（把注入块放到请求尾部） ── */
+  ctx.on(
+    'agent/pre-step',
+    async (payload, next): Promise<PreStepDecision> => {
+      // ① 永远先委托——不夺权、不改写别人的决策（§6.5）。
+      const decision = await next()
+      try {
+        if (!config.enabled) return decision
+        if (decision.kind !== 'enter') return decision
+        if (payload.signal?.aborted) return decision
+        // 读侧：注入时机（回合首发 / 自主态节律 / 压缩重注）由 buildTailInjection 全权裁定。
+        const text = await buildTailInjection(deps, payload.agent, payload.turn, payload.step, payload.messages)
+        // 写侧 nudge 消费：installWriteObservation 已把评估结果存入 state.pendingNudgeText。
+        // 读侧只负责追加消息（若 nudge 有值）；评估本身不在此处。
+        const wstate = peekSession(payload.agent.session.id)
+        const nudgeText = wstate?.pendingNudgeText ?? null
+        if (wstate) wstate.pendingNudgeText = null // 消费即清（防下步重复追加）
+        const extra: unknown[] = []
+        if (text) extra.push(createInjectionMessage(text))
+        if (nudgeText) extra.push(createWriteNudgeMessage(nudgeText))
         if (extra.length === 0) return decision
         // ② 追加到批次末尾 = 请求消息数组的尾部（在 assistant 回答之前）。
         return { ...decision, messages: [...decision.messages, ...extra] }
@@ -829,20 +907,8 @@ export function installInjection(
     { prepend: true },
   )
 
-  /* ── DESIGN §6.5 点名的拦截点：只读观测 + 审计 + 永远 next() 委托 ──
-     计时口径（2026-09-13 用户拍板）：时间锚只量「模型实际思考时间」——
-     即 llm/stream 的真实流时长（next() 的执行跨度），工具执行与空闲不计入。 */
+  /* ── DESIGN §6.5 点名的拦截点：只读审计 + 永远 next() 委托 ── */
   ctx.on('llm/stream', (options, next) => {
-    const t0 = Date.now()
-    const accumulate = (): void => {
-      try {
-        const sid = (options as { sessionId?: string })?.sessionId
-        const st = sid ? peekSession(sid) : undefined
-        if (st) st.activeMs += Date.now() - t0
-      } catch {
-        /* 计时失败不影响主流程 */
-      }
-    }
     try {
       const sessionId = options?.sessionId
       const state = sessionId ? peekSession(sessionId) : undefined
@@ -865,16 +931,6 @@ export function installInjection(
     } catch (e) {
       deps.log('warn', `llm-stream-audit-failed: ${String((e as Error)?.message ?? e)}`)
     }
-    try {
-      const r = next() as unknown as { then?: unknown; finally?: unknown }
-      if (r && typeof r === 'object' && typeof (r as { finally?: unknown }).finally === 'function') {
-        return (r as unknown as Promise<unknown> & { finally(cb: () => void): unknown }).finally(accumulate)
-      }
-      accumulate()
-      return r
-    } catch (e) {
-      accumulate()
-      throw e
-    }
+    return next()
   })
 }

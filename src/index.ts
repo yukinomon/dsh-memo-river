@@ -10,9 +10,10 @@
  */
 import type { Context } from 'cordis'
 import { Config, type Config as MemoRiverConfig } from './config.js'
+import { createCandidateProvider } from './candidates.js'
 import { WorkspaceDaemon } from './daemon.js'
 import { healthReport } from './health.js'
-import { installInjection, messageText, type AgentLike } from './injector.js'
+import { installInjection, installWriteObservation, messageText, type AgentLike } from './injector.js'
 import { FIXED_CONTRACT_SHA256, FIXED_CONTRACT_TEXT } from './prompt.js'
 import { Logger, dshHome } from './runtime.js'
 import { getSession, takeDrafts, dropSession, listSessions, SUBSTANTIVE_REPORT_CHARS, type PendingDraft } from './session.js'
@@ -248,7 +249,34 @@ export function apply(ctx: AppContext, config: MemoRiverConfig): void {
 
   /* ────────── ② 注入 seam：agent/pre-step（尾注入）+ llm/stream（委托 + 审计） ────────── */
 
-  installInjection(ctx as unknown as Parameters<typeof installInjection>[0], { config, getWorkspace, log })
+  /* 2B-2b 三档语义（§5.1）：
+   *   provideCandidates:true  → 不注册被动注入，注册候选提供者（retrieval-only 对外窗口）；
+   *   enabled:false           → 既不注入也不交候选（⑨ 收束，安全默认）；
+   *   enabled:true（缺省）     → 注入（上游默认行为，现行为逐位不变）。
+   * provideCandidates 优先于 enabled：即使 enabled:true 也让位——「对外窗口」与「被动注入」
+   * 是两种互斥的读侧形态，同时注册会让 vcp 融合层收到双份语义（候选 + 注入文本）。 */
+  if (config.inject.provideCandidates) {
+    const provider = createCandidateProvider({ config, getWorkspace, log })
+    /* 候选提供者不注册任何事件监听（retrieval-only）；挂在 ctx 上供同进程消费方发现。
+     * Symbol.for 键 = 跨模块实例共享（同一进程两条 URL 各加载一次时，wrapper 与包名
+     * 两个模块实例都能找到同一个提供者——与 routePools 的跨实例理由一致，index.ts:103）。
+     * dispose = 从全局表摘除（fiber 收口时由 cordis 调用）。 */
+    const PROVIDER_KEY = Symbol.for('@dsh-external/dsh-memo-river/candidateProvider')
+    const holder = globalThis as unknown as Record<symbol, unknown>
+    holder[PROVIDER_KEY] = provider
+    log('info', 'candidate-provider-registered retrieval-only=1（不注册注入 seam）')
+    ctx.effect(() => () => { delete holder[PROVIDER_KEY] }, 'memo-river: candidate provider')
+  } else if (config.inject.enabled) {
+    installInjection(ctx as unknown as Parameters<typeof installInjection>[0], { config, getWorkspace, log })
+  }
+
+  /* ────────── ②b 写侧观测 seam（2B-2a 独立生命周期）──────────
+   * 写侧观测（memo_write 扫描 / contextChars / 委托闩锁 / 压缩计数 / nudge 评估）与
+   * 读侧注入拆分——`inject.enabled: false` 时写侧仍运行，nudge 仍按原触发条件得出判定。
+   * `inject.writeObservation: false` 可完全关闭写侧（回退旧行为）。 */
+  if (config.inject.writeObservation) {
+    installWriteObservation(ctx as unknown as Parameters<typeof installWriteObservation>[0], { config, getWorkspace, log })
+  }
 
   /* ────────── ③ 工具面 ────────── */
 

@@ -8,6 +8,16 @@
  *   ③ `rerankMemoDtsc(...)` 或 `rerankRivermemoTopologyV3(...)` → 读出
  *
  * 一切向量/图/读出计算都在 Rust；本模块只做索引装载与载荷组装。
+ *
+ * D154 联合路径（上游生产默认范式）：`MemoEngine.executeRiverQuery` 把
+ * 「ANN → 合并 → hydrate → 语义去重 → Topology V3」整体交给 Rust 一次 N-API 任务，
+ * payload 的 candidates 由 Rust 覆盖；legacy 的 rerankTopologyV3 保留为回退。
+ *
+ * 回放契约（D193）：artifact 代际由 `artifactSig` 标识，但**配置漂移不总反映在 sig 上能观测的
+ * 层面**——故本模块在 TS 侧自算 `configHash`（hashStable(kbm,32)，对齐上游
+ * `modules/tagmemoV10/immutable.js:43`），构建时冻结进 `ArtifactState`，三个读出口
+ * （runPipeline / rerankDtsc / rerankTopologyV3）每次比对，失配即抛
+ * `MEMO_RIVER_REPLAY_MISMATCH`。读出结果带版本戳信封（D160，见 withResultEnvelope）。
  */
 import { createRequire } from 'node:module'
 import { existsSync, readFileSync, statSync } from 'node:fs'
@@ -74,13 +84,98 @@ export interface NativeVexusIndex {
   stats?(): unknown
 }
 
+/** registerDiaryIndex 的返回注册态（实测 2026-10-12，与上游 index.d.ts RegisteredDiaryIndexState 对齐；
+ *  generation 是 unregisterDiaryIndex 的必带参数，只能从这里拿）。 */
+export interface RegisteredDiaryIndexState {
+  diaryName: string
+  generation: number
+  contentRevision: number
+  dimension: number
+  totalVectors: number
+}
+
 export interface NativeKnowledgeRuntime {
-  registerDiaryIndex(diaryName: string, diaryIndex: NativeVexusIndex): void
-  unregisterDiaryIndex?(diaryName: string): void
+  registerDiaryIndex(diaryName: string, diaryIndex: NativeVexusIndex): RegisteredDiaryIndexState
+  /** 实测（2026-10-12 行为探针，vexus-lite.win32-x64-msvc.node）：二参必选（缺省抛 N-API 转换错），
+   *  代际不匹配/未注册返回 false，generation ≤ 0 抛错（Rust 侧校验）。 */
+  unregisterDiaryIndex?(diaryName: string, expectedGeneration: number): boolean
   listDiaryIndices?(): unknown
   stats?(): unknown
   shutdown?(): void
+
+  /* ── D154 联合查询 ABI（上游生产默认范式）─────────────────────────────────
+   *
+   * 实测打印 `vexus-lite.win32-x64-msvc.node` 的 NativeKnowledgeRuntime.prototype
+   * 共 10 个方法：diaryIndexState / executeRiverQuery / executeRiverQueryHybrid /
+   * listDiaryIndices / registerDiaryIndex / searchDiaryIndices /
+   * searchDiaryIndicesDeduplicated / shutdown / stats / unregisterDiaryIndex。
+   * 形状以 index.d.ts:203/211 与 knowledge_runtime.rs:1051/:1171 为准（实测行号一致）。
+   *
+   * 联合路径把「多索引 ANN → Chunk ID 合并 → SQLite 批量向量 hydrate → 语义去重
+   * → Topology V3」整体搬进 Rust 的一次 N-API 后台任务：river_input_json 里的
+   * `candidates` 会被 Rust 覆盖（knowledge_runtime.rs:694-724），JS 侧不再需要
+   * 先算 KNN 再整包递进去。返回类型与 rerankRivermemoTopologyV3 一致（JSON 字符串）。
+   *
+   * 标记 optional：本仓在 vcp 轨用真上游二进制，reimpl 轨（kernel/ 复刻）尚未实现
+   * 这两个方法，缺方法时应由调用方显式报「ABI 不可用」而不是 TS 层静默 undefined。
+   * 注册但**不接**的方法（searchDiaryIndices / searchDiaryIndicesDeduplicated /
+   * diaryIndexState）不入接口——本单不消费，加了反而制造"看起来能用"的假面。 */
+  executeRiverQuery?(
+    dbPath: string,
+    artifactSig: string,
+    riverInputJson: string,
+    diaryNames: string[],
+    query: Float32Array,
+    perIndexK: number,
+    candidateK: number,
+    semanticThreshold: number,
+  ): Promise<string>
+  /** Native Query Plan V2 变体（supplemental 向量 + BM25/Time 文件候选）。
+   *  **本单不接**：本地没有历史分段向量 / Time / BM25 融合输入，登记只为记录 ABI 面。 */
+  executeRiverQueryHybrid?(
+    dbPath: string,
+    artifactSig: string,
+    riverInputJson: string,
+    diaryNames: string[],
+    query: Float32Array,
+    supplementalVectors: Float32Array,
+    hybridPlanJson: string,
+    perIndexK: number,
+    candidateK: number,
+    semanticThreshold: number,
+  ): Promise<string>
 }
+
+/** D154 联合查询的调用参数（由 MemoEngine.executeRiverQuery 组装并校验）。 */
+export interface RiverJointQueryParams {
+  queryId: string
+  queryText: string
+  observationHandle: string
+  queryVector: Float32Array
+  /** 管线产出的查询几何状态（与 rerankTopologyV3 的 meta 同源）。 */
+  meta: Record<string, unknown>
+  /** 每个已注册日记索引取的近邻数（上游 nativeRiverQueryPerIndexK，缺省 300）。 */
+  perIndexK?: number
+  /** 进入语义去重阶段的候选池上限（上游 nativeRiverQueryCandidateK，缺省 300）。 */
+  candidateK?: number
+  /** 语义去重阈值（上游 nativeRiverQuerySemanticThreshold，缺省 0.92）。 */
+  semanticThreshold?: number
+  /** 输出条数上限（上游 options.topK → payload.topK）。 */
+  topK?: number
+}
+
+/** D163：权限作用域为空时的错误码，对齐上游
+ *  `KnowledgeBaseManager.js:2133` 的 `NATIVE_RIVER_QUERY_EMPTY_PERMISSION_SCOPE`。 */
+export const RIVERMEMO_EMPTY_PERMISSION_SCOPE = 'NATIVE_RIVER_QUERY_EMPTY_PERMISSION_SCOPE'
+
+/** D154：联合 ABI 不可用（reimpl 轨未实现 executeRiverQuery）。错误码对齐上游
+ *  `RiverMemoEngine.js:241-247` 的 `NATIVE_RIVER_QUERY_ABI_UNAVAILABLE`。 */
+export const RIVERMEMO_JOINT_ABI_UNAVAILABLE = 'NATIVE_RIVER_QUERY_ABI_UNAVAILABLE'
+
+/** D154：未提供日记作用域。上游对应
+ *  `KnowledgeBaseManager.js:2111` / `RiverMemoEngine.js:253` 的
+ *  `NATIVE_RIVER_QUERY_EMPTY_DIARY_SCOPE`。 */
+export const RIVERMEMO_EMPTY_DIARY_SCOPE = 'NATIVE_RIVER_QUERY_EMPTY_DIARY_SCOPE'
 
 export interface NativeVexusModule {
   VexusIndex: new (dim: number, capacity: number) => NativeVexusIndex
@@ -125,6 +220,51 @@ type Bag = Record<string, unknown>
 const bag = (v: unknown): Bag => (v && typeof v === 'object' ? (v as Bag) : {})
 const num = (v: unknown, fallback: number): number => (typeof v === 'number' && Number.isFinite(v) ? v : fallback)
 
+/* ── configHash（D193）：上游 `modules/tagmemoV10/immutable.js:5-48` 的 hashStable 语义 ──
+ * Rust 侧 `config_hash = hash_text(serde_json::to_string(effective_config), 32)` 把配置摘要
+ * 编进 artifact_sig 的六个输入之一（memo_artifact_builder.rs:778-797），但**不随
+ * rebuildMemoArtifact 的返回值回传**（实测 win32 二进制 keys 无 configHash，
+ * 上游 index.d.ts:22-35 同）——上游 JS 也是自己算（`_resolveArtifactBuildContext:431`）。
+ * 故 TS 侧必须自算，才能把「配置是否变了」当成独立不变量来校验。
+ *
+ * 与 Rust 的对应关系：serde_json 无 preserve_order feature（两个 Cargo.toml 均无），
+ * 序列化 Value::Object 时按键排序，与这里的 `Object.keys().sort()` 同序。
+ * 本地只做自校验（与构建时冻结值比对），不要求与 Rust 逐位相同。 */
+
+/** 确定性序列化：递归键排序。形状照上游 stableSerialize，去 Set/Map 分支（KBM 是纯 JSON）。 */
+function stableSerialize(value: unknown): string {
+  if (value === null || value === undefined) return JSON.stringify(value ?? null)
+  if (typeof value === 'number') return Number.isFinite(value) ? JSON.stringify(value) : JSON.stringify(String(value))
+  if (typeof value === 'bigint') return JSON.stringify(value.toString())
+  if (typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map((item) => stableSerialize(item)).join(',')}]`
+  const obj = value as Bag
+  return `{${Object.keys(obj)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableSerialize(obj[key])}`)
+    .join(',')}}`
+}
+
+/** sha256(stableSerialize(v)) 截断到 length（上游 clamp 到 [8,64]）。 */
+export function hashStable(value: unknown, length = 32): string {
+  const { createHash } = requireFromNodeCrypto()
+  const n = Math.max(8, Math.min(64, Number(length) || 32))
+  return createHash('sha256').update(stableSerialize(value), 'utf8').digest('hex').slice(0, n)
+}
+
+/** 延迟取 node:crypto —— 顶部 import 会改动静依赖面，而本模块只在这一处用。 */
+function requireFromNodeCrypto(): typeof import('node:crypto') {
+  return requireFromHere('node:crypto') as typeof import('node:crypto')
+}
+
+/* ── D160 结果信封版本戳 ──
+ * 上游 `RiverMemoEngine.js:476-482` 的结果信封带 6 个版本戳字段，本地裸 JSON 直接透出。
+ * 上游 Rust 的 NativeOutput 已带 schema/algorithmVersion/artifactSig/queryId，但 TS 从不读。
+ * 这里在 TS 侧补齐**内核未提供**的三个（schema/version/configHash），内核已提供的用
+ * `??` 兜底而不覆盖。schema 名与上游同字符串，便于跨端对账。 */
+const RESULT_SCHEMA = 'rivermemo-topology-v3-result-v1'
+const RESULT_VERSION = 'rivermemo_v1'
+
 export function pipelineConfig(kbm: Record<string, unknown>): Record<string, unknown> {
   const rm = bag(kbm.riverMemo)
   const local = bag(rm.localField)
@@ -135,6 +275,9 @@ export function pipelineConfig(kbm: Record<string, unknown>): Record<string, unk
   const activation = kbm.activationMultiplier
   const dynBoost = kbm.dynamicBoostRange
   const coreRange = kbm.coreBoostRange
+  // 上游 KBM.js:1434：spikeRouting 读 KBM 顶层（非 riverMemo 子树）；maxEmergentNodes
+  // 上游也从 spikeRouting 提取到 PipelineConfig 顶层（KBM.js:1581，Rust SenseConfig 无此字段）。
+  const spike = bag(kbm.spikeRouting)
   return {
     baseTagBoost: num(source.baseTagBoost, 0.6),
     coreBoostFactor: num(source.coreBoostFactor, 1.33),
@@ -156,6 +299,23 @@ export function pipelineConfig(kbm: Record<string, unknown>): Record<string, unk
     langPenaltyUnknown: num(lang.penaltyUnknown, 0.05),
     langPenaltyCrossDomain: num(lang.penaltyCrossDomain, 0.1),
     deduplicationThreshold: num(kbm.deduplicationThreshold, 0.88),
+    // ── 5 键补全（段3 批1b）：上游 KBM.js:1577-1595 同名组装，默认值=Rust 编译默认。
+    maxFusionTags: Math.max(1, Math.floor(num(kbm.maxFusionTags, 128))),
+    maxEmergentNodes: Math.max(0, Math.floor(num(spike.maxEmergentNodes, 50))),
+    techTagThreshold: num(kbm.techTagThreshold, 0.08),
+    normalTagThreshold: num(kbm.normalTagThreshold, 0.015),
+    spikeRouting: {
+      maxSafeHops: num(spike.maxSafeHops, 4),
+      baseMomentum: num(spike.baseMomentum, 2),
+      firingThreshold: num(spike.firingThreshold, 0.1),
+      baseDecay: num(spike.baseDecay, 0.25),
+      wormholeDecay: num(spike.wormholeDecay, 0.7),
+      tensionThreshold: num(spike.tensionThreshold, 1),
+      maxNeighborsPerNode: num(spike.maxNeighborsPerNode, 20),
+      returnFlowFactor: num(spike.v91ReturnFlowFactor, 0.15),
+      firGamma: num(spike.v91FirGamma, 0.6),
+      maxPropagationStates: num(spike.v91MaxPropagationStates, 2000),
+    },
   }
 }
 
@@ -279,6 +439,13 @@ export interface MemoEngineOptions {
 
 export interface ArtifactState {
   artifactSig: string
+  /**
+   * D193：构建时冻结的配置摘要（hashStable(this.kbm, 32)，对齐上游
+   * `_resolveArtifactBuildContext:431`）。Rust 已把它编进 artifactSig 的六个输入之一，
+   * 但**不回传**；TS 侧自算才能把它当独立不变量：读出口每次比对当前 kbm 的摘要，
+   * 失配即抛（`assertReplayCompatible`），而不是静默拿旧资产跑新参数。
+   */
+  configHash: string
   builtAt: number
   elapsedMs: number
   nodeCount: number
@@ -403,6 +570,7 @@ export class MemoEngine {
       runtime.registerDiaryIndex(this.options.diaryName, diaryIndex)
       this.runtime = runtime
     } else {
+      console.warn('[memo-river] 上游二进制未导出 NativeKnowledgeRuntime，运行时降级为空')
       this.runtime = null
     }
     this.artifact = null
@@ -479,12 +647,16 @@ export class MemoEngine {
   async ensureArtifactLocked(force = false): Promise<ArtifactState> {
     if (!this.tagIndex) throw new Error('engine-not-loaded')
     const ti = this.tagIndex
+    const configHash = hashStable(this.kbm, 32)
     const input = JSON.stringify({ modelSig: this.options.modelSig, effectiveConfig: this.kbm })
     const t0 = Date.now()
     const result = (await this.withNative(() =>
       ti.rebuildMemoArtifact(this.options.store.dbPath, input),
     )) as NativeMemoArtifactBuildResult
-    const unchanged = !force && this.artifact?.artifactSig === result.artifactSig
+    /* D193：比对的是「六输入摘要」而非只有 artifactSig。Rust 已把 configHash 编进
+     * artifactSig（memo_artifact_builder.rs:786-797），此处再显式比一遍是为了让
+     * 「配置变了但 sig 未变」这类内核层失配在 TS 侧**显式失败**，而不是静默复用旧资产。 */
+    const unchanged = !force && this.artifact?.artifactSig === result.artifactSig && this.artifact?.configHash === configHash
     const dbPath = this.options.store.dbPath
     const modelSig = this.options.modelSig
 
@@ -538,6 +710,7 @@ export class MemoEngine {
 
     const state: ArtifactState = {
       artifactSig: result.artifactSig,
+      configHash,
       builtAt: Date.now(),
       elapsedMs: unchanged ? 0 : Date.now() - t0,
       nodeCount: result.nodeCount,
@@ -551,6 +724,32 @@ export class MemoEngine {
     return state
   }
 
+  /**
+   * D193：回放契约校验。上游 `TagMemoV10Engine.js:1581-1598 assertReplayCompatible` 的本地对位——
+   * 逐项比对「查询期配置」与「构建期冻结的配置摘要」，任一失配即抛，**不静默**。
+   *
+   * 为什么必须做：Rust 把 configHash 编进 artifactSig（内核层已挡配置漂移），但
+   * `pipelineConfig(this.kbm)` / `topologyV3Config(this.kbm)` 是**每次调用现映射**的。
+   * 一旦 kbm 在 artifact 构建后被改动（配置热更、运行时覆写、未来新入口），
+   * 就会出现「图资产是旧配置的、查询参数是新配置的」——结果与新配置不一致且无任何提示。
+   * 本方法把这种失配变成可归因的异常（照上游 error 形状：code + mismatches 数组）。
+   *
+   * 三个读出口（runPipeline / rerankDtsc / rerankTopologyV3）各自调用：它们是三个独立
+   * 公有入口，调用方只走其中一个，只堵一处会漏。
+   */
+  private assertReplayCompatible(): void {
+    const art = this.artifact
+    if (!art) throw new Error('artifact-not-ready')
+    const current = hashStable(this.kbm, 32)
+    if (current === art.configHash) return
+    const err = new Error(
+      `memo-river artifact is not replay-compatible: configHash (built=${art.configHash}, current=${current})`,
+    ) as Error & { code?: string; mismatches?: string[] }
+    err.code = 'MEMO_RIVER_REPLAY_MISMATCH'
+    err.mismatches = ['configHash']
+    throw err
+  }
+
   /** ② runMemoPipeline：一次 N-API 提交拿观测包（enhancedVector + observationHandle）。 */
   async runPipeline(
     queryId: string,
@@ -560,6 +759,7 @@ export class MemoEngine {
     ghostTags: string[] = [],
   ): Promise<{ metadata: Record<string, unknown>; enhancedVector: Float32Array; elapsedMs: number }> {
     if (!this.tagIndex || !this.artifact) throw new Error('artifact-not-ready')
+    this.assertReplayCompatible()
     const ti = this.tagIndex
     const activeSig = this.artifact.artifactSig
     const t0 = Date.now()
@@ -596,6 +796,7 @@ export class MemoEngine {
     candidates: Array<{ id: number; score: number }>,
   ): Promise<Record<string, unknown>> {
     if (!this.tagIndex || !this.artifact) throw new Error('artifact-not-ready')
+    this.assertReplayCompatible()
     const ti = this.tagIndex
     const activeSig = this.artifact.artifactSig
     const raw = await this.gate(() =>
@@ -614,7 +815,7 @@ export class MemoEngine {
         ),
       ),
     )
-    return parseJsonObject(raw)
+    return withResultEnvelope(parseJsonObject(raw), this.artifact)
   }
 
   /** ③-b RiverMemo Topology V3 读出（Ω / specificity / rarity 在这条上）。 */
@@ -626,6 +827,7 @@ export class MemoEngine {
     candidates: Array<{ id: number; score: number }>,
   ): Promise<Record<string, unknown>> {
     if (!this.tagIndex || !this.artifact) throw new Error('artifact-not-ready')
+    this.assertReplayCompatible()
     const ti = this.tagIndex
     const activeSig = this.artifact.artifactSig
     const raw = await this.gate(() =>
@@ -664,7 +866,111 @@ export class MemoEngine {
         ),
       ),
     )
-    return parseJsonObject(raw)
+    return withResultEnvelope(parseJsonObject(raw), this.artifact)
+  }
+
+  /**
+   * D154：联合路径读出——一次 `executeRiverQuery` 内完成
+   * 多索引 ANN → Chunk ID 合并 → 向量 hydrate → 语义去重 → Topology V3。
+   *
+   * 与 rerankTopologyV3 的分工：legacy 路由 JS 先算 KNN 候选（recall.ts 的 candidatePool）
+   * 再整包塞进 payload；联合路由 Rust 自己跑 ANN，payload 的 candidates 被覆盖
+   * （knowledge_runtime.rs:694-724），JS 侧只递控制面 + 权限域。
+   *
+   * D163 权限作用域：`allowedFileIds` 由本引擎的 diaryName 查 files 表得到
+   * （对位上游 KnowledgeBaseManager.js:2121-2136 的
+   * `SELECT id FROM files WHERE diary_name IN (...)`）。**空域即抛**
+   * `NATIVE_RIVER_QUERY_EMPTY_PERMISSION_SCOPE`——fail-closed，不放行「恒可见」。
+   * （Rust 侧 `allowed_file_ids` 缺省为空 → `explicit_scope=false` → 不过滤，
+   *  见 rivermemo_topology_v3.rs:2654-2655；本地单桶单 agent 场景实际不改变可见集，
+   *  本方法补的是闸。）
+   *
+   * 调用方必须已在引擎临界区内（runExclusive 体），且 artifact 就绪。
+   */
+  async executeRiverQuery(params: RiverJointQueryParams): Promise<Record<string, unknown>> {
+    if (!this.tagIndex || !this.artifact) throw new Error('artifact-not-ready')
+    this.assertReplayCompatible()
+    const ti = this.tagIndex
+    const runtime = this.runtime
+    if (!runtime || typeof runtime.executeRiverQuery !== 'function') {
+      const err = new Error('NativeKnowledgeRuntime joint River ABI is unavailable') as Error & { code?: string }
+      err.code = RIVERMEMO_JOINT_ABI_UNAVAILABLE
+      throw err
+    }
+    const dbPath = this.options.store.dbPath
+    const activeSig = this.artifact.artifactSig
+    const diaryNames = [...new Set([this.options.diaryName].map((n) => n.trim()).filter(Boolean))]
+    if (diaryNames.length === 0) {
+      const err = new Error('Native joint River query requires an explicit diary scope') as Error & { code?: string }
+      err.code = RIVERMEMO_EMPTY_DIARY_SCOPE
+      throw err
+    }
+
+    /* D163：权限域 —— 本地是单桶单 diary，一次查询即上游的 IN (?) 单值情形。
+     * 复用 store.files(diaryName)（store.ts:155-160），不另写 SQL。 */
+    const allowedFileIds = this.options.store
+      .files(diaryNames[0])
+      .map((f) => Number(f.id))
+      .filter((id) => Number.isSafeInteger(id))
+    if (allowedFileIds.length === 0) {
+      const err = new Error('Native River query resolved an empty file permission scope') as Error & { code?: string }
+      err.code = RIVERMEMO_EMPTY_PERMISSION_SCOPE
+      throw err
+    }
+
+    const queryVector = params.queryVector
+    if (queryVector.length !== this.options.dimension) {
+      throw new Error(
+        `Native River query dimension mismatch: expected ${this.options.dimension}, got ${queryVector.length}`,
+      )
+    }
+    const finalK = Math.max(1, Math.floor(params.topK ?? 8))
+    const perIndexK = Math.max(1, Math.floor(params.perIndexK ?? 300))
+    const candidateK = Math.max(finalK, Math.floor(params.candidateK ?? 300))
+    const semanticThreshold = Math.max(-1, Math.min(1, params.semanticThreshold ?? 0.92))
+
+    /* payload 与 rerankTopologyV3 同构（同一个 run_native 入口、同一 NativeInput），
+     * 只多 allowedFileIds 与 candidates 哨兵。candidates 必填（Rust 侧覆盖），
+     * 递哨兵而非空数组——与上游 RiverMemoEngine.js:2270 的 `[{id:1,chunkId:1,score:0}]` 一致。 */
+    const payload = {
+      observationHandle: params.observationHandle,
+      dimension: this.options.dimension,
+      topK: finalK,
+      includeTrace: true,
+      config: topologyV3Config(this.kbm),
+      query: { text: params.queryText, vector: [] },
+      queryState: {
+        queryId: params.queryId,
+        sourceField: [],
+        localField: [],
+        transferField: [],
+        localDomain: { ids: [] },
+        transferDomain: { ids: [] },
+        queryRiverGraph: params.meta.queryRiverGraph ?? null,
+        sourceObservation: {
+          epa: params.meta.epa ?? {},
+          pyramid: params.meta.pyramid ?? {},
+          diagnostics: params.meta.diagnostics ?? {},
+        },
+        fieldDiagnostics: { backend: 'vexus-unified-memo-pipeline-handle' },
+      },
+      candidates: [{ id: 1, chunkId: 1, score: 0 }],
+      allowedFileIds,
+    }
+
+    const raw = await this.withNative(() =>
+      runtime.executeRiverQuery!(
+        dbPath,
+        activeSig,
+        JSON.stringify(payload),
+        diaryNames,
+        queryVector,
+        perIndexK,
+        candidateK,
+        semanticThreshold,
+      ),
+    )
+    return withResultEnvelope(parseJsonObject(raw), this.artifact)
   }
 
   statsSnapshot(): unknown {
@@ -685,6 +991,22 @@ export class MemoEngine {
     this.tagIndex = null
     this.diaryIndex = null
     this.artifact = null
+  }
+}
+
+/**
+ * D160：给读出结果补版本戳。内核已返回的字段不覆盖（`??` 兜底）。
+ * `configHash` 一并带上——它是 D193 的诊断出口：消费方看到 sig 相同而 configHash 不同时，
+ * 说明这次结果与当前配置不同源（recall.ts 的诊断栏直接可见）。
+ */
+function withResultEnvelope(raw: Record<string, unknown>, artifact: ArtifactState | null): Record<string, unknown> {
+  if (!artifact) return raw
+  return {
+    ...raw,
+    schema: raw.schema ?? RESULT_SCHEMA,
+    version: raw.version ?? RESULT_VERSION,
+    artifactSig: raw.artifactSig ?? artifact.artifactSig,
+    configHash: artifact.configHash,
   }
 }
 

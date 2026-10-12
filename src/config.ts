@@ -18,6 +18,26 @@ export interface EmbedConfig {
 }
 
 export interface InjectConfig {
+  /** ⑨ 收束：false=不注册 agent/pre-step 被动注入（installInjection 不调），工具面/守护/日记库不受影响。 */
+  enabled: boolean
+  /**
+   * retrieval-only 候选供源开关（2B-2b）。true = 不注册被动注入，改为注册候选提供者
+   * （candidates.ts createCandidateProvider——只检索、返回结构化候选，绝不注入）。
+   * 缺省 false = 现行为逐位不变（enabled 决定注入，无对外候选接口）。
+   * 与 enabled 的三档语义（§5.1）：
+   *   enabled:false + provideCandidates:false → 既不注入也不交候选（⑨ 现状，安全默认）
+   *   enabled:true  + provideCandidates:false → 注入（上游默认）
+   *   provideCandidates:true → 不注入，交候选（本开关独立于 enabled——即使 enabled:true 也让位）
+   */
+  provideCandidates: boolean
+  /**
+   * 写侧观测与 nudge 评估的独立生命周期开关（2B-2a）。
+   * true（缺省）= 始终注册写侧观测（memo_write 扫描 / contextChars / 委托闩锁 / 压缩计数 / nudge 评估 + 消息呈现），
+   *   不受 `enabled` 影响——`enabled: false` 时写侧仍运行。
+   * false = 完全关闭写侧（回退到 2B-2a 以前 `enabled: false` 的旧行为：写侧随注入一起停）。
+   * 拆分理由：生产 `enabled: false`（cordis.patch.yml:980）导致写侧提醒自 2026-10-09 起实际停摆。
+   */
+  writeObservation: boolean
   /** 门控开关（DESIGN.md §6.3；《《》》 语义）。 */
   gate: boolean
   /** 条数上限。 */
@@ -221,6 +241,12 @@ export const Config: z<Config> = z.object({
 
   inject: z
     .object({
+      /** ⑨ 收束：false=不注册 agent/pre-step 被动注入（installInjection 不调）。 */
+      enabled: z.boolean().default(true),
+      /** 2B-2b：retrieval-only 候选供源（true=不注入、对外交结构化候选；缺省 false=现行为等价）。 */
+      provideCandidates: z.boolean().default(false),
+      /** 2B-2a：写侧观测与 nudge 评估独立生命周期（true=始终注册，不受 enabled 影响；false=回退旧行为）。 */
+      writeObservation: z.boolean().default(true),
       gate: z.boolean().default(true),
       k: z.number().min(1).default(3),
       tokenBudget: z.number().min(1).default(600),

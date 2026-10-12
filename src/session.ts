@@ -130,6 +130,12 @@ export interface SessionState {
   activeMsAnchor: number
   /** 上次 pre-step 观测到的会话日志长度（memo_write 增量扫描的游标）。 */
   lastObservedLogLength: number
+  /**
+   * 2B-2a：写侧观测算出的 nudge 文本（供 installInjection 的 pre-step 消费）。
+   * 由 installWriteObservation 每 pre-step 设置（null=无提醒）；installInjection 读它追加消息。
+   * inject.enabled: false 时 installInjection 不注册 → 此值仍被计算但不消费（留给未来唯一输出协调点）。
+   */
+  pendingNudgeText: string | null
   /** 注入次数 / 跳过次数（体检与日志）。 */
   injectedCount: number
   skippedCount: number
@@ -185,6 +191,7 @@ export function getSession(sessionId: string, cwd: string | null): SessionState 
     activeMsAnchor: 0,
     nudgeAnchorChars: 0,
     lastObservedLogLength: 0,
+    pendingNudgeText: null,
     injectedCount: 0,
     skippedCount: 0,
     inflight: null,
