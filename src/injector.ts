@@ -645,12 +645,15 @@ export function evaluateWriteNudge(
  * 注册注入 seam。返回 disposer 列表（调用方用 ctx.effect 包住）。
  */
 
-/** 票12①/票11：会话对应桶的日记目录（纯路径解析，无副作用）。失败 → null。 */
-function diaryDirFor(agent: unknown, wstate: SessionState): string | null {
+/** 票12①/票11：会话对应桶的日记目录（纯路径解析，无副作用）。失败 → null。
+ *
+ * 扫描根取自 `WorkspacePaths.diaryDir`（`Config.diaryDir` 非空时为外部真源目录，
+ * 否则仍是 `root/dailynote/<bucket>` 派生）。**只读**：本函数不建目录、不写盘。 */
+function diaryDirFor(agent: unknown, wstate: SessionState, diaryDirOverride?: string): string | null {
   try {
     const cwd = resolveCwd(agent as never, wstate)
-    const paths = workspacePaths(cwd)
-    return join(paths.root, 'dailynote', paths.bucket)
+    const paths = workspacePaths(cwd, undefined, undefined, diaryDirOverride)
+    return paths.diaryDir
   } catch {
     return null
   }
@@ -661,9 +664,8 @@ function diaryDirFor(agent: unknown, wstate: SessionState): string | null {
  * **不走 deps.getWorkspace**——实测其副作用会扰动注入用的工作区/嵌入实例
  * （#11/#25/#26/#31 五连红，双盲回退 injector 后复绿，定位于此）。失败/无日记 → null。 */
 function lastDiaryTail(deps: InjectorDeps, agent: unknown, wstate: SessionState): string | null {
-  void deps
   try {
-    const dir = diaryDirFor(agent, wstate)
+    const dir = diaryDirFor(agent, wstate, deps.config.diaryDir)
     if (!dir) return null
     const names = readdirSync(dir).filter((n) => n.endsWith('.md'))
     if (names.length === 0) return null
@@ -681,9 +683,14 @@ function lastDiaryTail(deps: InjectorDeps, agent: unknown, wstate: SessionState)
 /** 票11：委托变体引导（堵改疏）——冷门 Tag 建议（剔枢纽 ≥1/3，不足从词汇表补齐）+
  * 同轴合并提示（近期高 Tag 重叠 → 优先 update/merge 而非新开篇）。纯路径扫描
  * （nudge-guide，无 getWorkspace 副作用）；失败/空桶 → null（文案回落票 05/12 形态）。 */
-function delegationExtrasFor(agent: unknown, wstate: SessionState, suggested: string[]): DelegationExtras | null {
+function delegationExtrasFor(
+  agent: unknown,
+  wstate: SessionState,
+  suggested: string[],
+  diaryDirOverride?: string,
+): DelegationExtras | null {
   try {
-    const dir = diaryDirFor(agent, wstate)
+    const dir = diaryDirFor(agent, wstate, diaryDirOverride)
     if (!dir) return null
     const scan = scanTagAxis(dir)
     if (!scan || scan.files === 0) return null
@@ -789,7 +796,7 @@ export function installWriteObservation(
               } catch {
                 return null
               }
-            }, delegation, () => lastDiaryTail(deps, payload.agent, wstate), (suggested) => delegationExtrasFor(payload.agent, wstate, suggested))
+            }, delegation, () => lastDiaryTail(deps, payload.agent, wstate), (suggested) => delegationExtrasFor(payload.agent, wstate, suggested, config.diaryDir))
           : null
         if (wstate) wstate.pendingNudgeText = nudge
         // nudge 遥测落桶日志（评估触发即记，不依赖消息是否被消费）。

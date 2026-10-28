@@ -212,6 +212,18 @@ export interface Config {
    * 默认 'section'，因为「保前缀缓存 / 逐轮 hash 相等」只有在 section 上才成立。
    */
   promptChannel: 'section' | 'context' | 'both'
+  /**
+   * 日记目录覆盖（读侧扫描根）。
+   *
+   * 空串（默认）= 沿用现状派生 `~/.dsh/memo-river/<hash>/dailynote/<bucket>`——
+   * 不传本项时一切行为与改动前逐字相同。
+   *
+   * 非空 = **原样**用作读侧扫描根，典型是把检索读侧指向 VCP 真库
+   * （`<vcp-memo-data>/diaries/<bucket>/`）。只影响读侧两处纯路径扫描
+   * （接续锚 lastDiaryTail、委托引导 scanTagAxis）；写侧（memo_write /
+   * 草稿 pending）仍落本工作区根，外部目录**只读**。
+   */
+  diaryDir: string
   embed: EmbedConfig
   inject: InjectConfig
   write: WriteConfig
@@ -228,6 +240,8 @@ export const Config: z<Config> = z.object({
   intervalMs: z.number().min(10_000).default(900_000),
   bucket: z.string().default(''),
   logFile: z.string().default(''),
+  // 读侧扫描根覆盖（空串 = 沿用 root/dailynote/<bucket> 派生，默认行为不变）。
+  diaryDir: z.string().default(''),
   promptChannel: z.union([z.const('section'), z.const('context'), z.const('both')]).default('section'),
 
   embed: z

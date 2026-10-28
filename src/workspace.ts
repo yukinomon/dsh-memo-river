@@ -144,7 +144,7 @@ export class WorkspaceRuntime {
   }
 
   static open(cwd: string, config: Config): WorkspaceRuntime {
-    const paths = workspacePaths(cwd, config.bucket, config.logFile || undefined)
+    const paths = workspacePaths(cwd, config.bucket, config.logFile || undefined, config.diaryDir)
     ensureWorkspaceDirs(paths)
 
     const resolved = resolveEmbed(config, paths)
@@ -359,18 +359,41 @@ export interface BucketEntry {
   updatedAt: number
 }
 
-/** 列出状态根下全部桶（只读、永不抛；扫不动返回空）。 */
+/** 列出状态根下全部桶（只读、永不抛；扫不动返回空）。
+ *
+ * 目录识别跟随 reparse point（junction / symlink）：`Dirent.isDirectory()` 对
+ * Windows junction 返回 **false**（实测：f55bc4f566039ad7 → f83382ea9073e5df 是
+ * junction，isDirectory=false / isSymbolicLink=true），只认 isDirectory 会让用
+ * junction 挂进来的桶**整个消失**。故补 `statSync(full).isDirectory()` 一档。
+ * 断链 junction 上 statSync 会抛——必须逐条 try，否则一个坏链让整轮枚举归零。
+ *
+ * ⚠ **必须按 hash 去重**：junction 与它的目标解析出同一个 hash（同一份 workspace.json），
+ * 不去重就产生两个同 hash 同名的条目——实测 `resolveBucket('DSH Desktop')` 双命中，
+ * 直接报「桶名不唯一」拒绝路由（本机 f55bc4f5 与 f83382ea 正是这个形态）。
+ * 同名多条目还会让 availableBucketLines 的「可用桶」清单出现重复项。 */
 export function listBuckets(): BucketEntry[] {
   const out: BucketEntry[] = []
-  let roots: string[]
+  const rootDir = memoRiverRoot()
+  let dirents: import('node:fs').Dirent[]
   try {
-    roots = readdirSync(memoRiverRoot(), { withFileTypes: true })
-      .filter((d) => d.isDirectory())
-      .map((d) => join(memoRiverRoot(), d.name))
+    dirents = readdirSync(rootDir, { withFileTypes: true })
   } catch {
     return out
   }
-  for (const root of roots) {
+  // 真目录优先于 junction（两者指同一份数据，取真目录的路径更利于人工排查）。
+  const isRealDir = (d: import('node:fs').Dirent): boolean => d.isDirectory()
+  const isLinkDir = (d: import('node:fs').Dirent): boolean => {
+    if (!d.isSymbolicLink()) return false
+    try {
+      return statSync(join(rootDir, d.name)).isDirectory()
+    } catch {
+      return false // 断链：跳过，绝不因此中断整轮枚举
+    }
+  }
+  const dirs = [...dirents.filter(isRealDir), ...dirents.filter(isLinkDir)]
+  const seen = new Set<string>()
+  for (const d of dirs) {
+    const root = join(rootDir, d.name)
     const manifestPath = join(root, 'workspace.json')
     const hasDb = existsSync(join(root, 'knowledge_base.sqlite'))
     if (!hasDb && !existsSync(manifestPath)) continue
@@ -380,14 +403,17 @@ export function listBuckets(): BucketEntry[] {
       // 无 manifest 桶名：dailynote/ 唯一子目录名兜底（多个子目录无法定位桶名，跳过）
       try {
         const subs = readdirSync(join(root, 'dailynote'), { withFileTypes: true })
-          .filter((d) => d.isDirectory())
-          .map((d) => d.name)
+          .filter((s) => s.isDirectory())
+          .map((s) => s.name)
         if (subs.length === 1) bucket = subs[0]!
       } catch {
         /* 无 dailynote/：兜底不了 */
       }
     }
     if (!bucket) continue
+    const hash = (typeof manifest.hash === 'string' && manifest.hash) || basename(root)
+    if (seen.has(hash)) continue // junction ↔ 目标同 hash：只留真目录那条
+    seen.add(hash)
     let updatedAt = 0
     try {
       updatedAt = statSync(manifestPath).mtimeMs
@@ -395,7 +421,7 @@ export function listBuckets(): BucketEntry[] {
       /* 缺 manifest 记 0（排序垫底） */
     }
     out.push({
-      hash: (typeof manifest.hash === 'string' && manifest.hash) || basename(root),
+      hash,
       root,
       bucket,
       cwd: typeof manifest.cwd === 'string' ? manifest.cwd : null,
@@ -454,7 +480,7 @@ export function resolveBucket(folder: string): BucketResolution {
 export function acquireBucketRuntime(entry: BucketEntry, config: Config): WorkspaceRuntime {
   const existing = registry.get(entry.hash)
   if (existing) return existing
-  const paths = workspacePathsAtRoot(entry.root, entry.bucket, entry.cwd ?? undefined)
+  const paths = workspacePathsAtRoot(entry.root, entry.bucket, entry.cwd ?? undefined, config.diaryDir)
   const runtime = WorkspaceRuntime.openExisting(paths, config)
   registry.set(entry.hash, runtime)
   return runtime

@@ -128,7 +128,7 @@
                   # 8000 给离群（实测见过 9.2s / 12.6s）留出余量，同时仍有硬顶，
                   # 不退回「吞掉整轮交互预算」的老问题。
                   embedTimeoutMs: 8000
-                native: { vcpRoot: 'D:/scratch/vcp-v3-research/.upstream/VCPToolBox' }
+                native: { vcpRoot: 'D:/Download/dsh-vcp/upstream/repos/VCPToolBox' }
 
         # ── shell ───────────────────────────────────────────────────────────────────
 

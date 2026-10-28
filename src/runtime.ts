@@ -35,9 +35,33 @@ export interface WorkspacePaths {
   logPath: string
   /** 日记本桶名（diary_name），DESIGN §6.2「本桶=…」。 */
   bucket: string
+  /**
+   * 日记目录（读侧扫描根：接续锚 `lastDiaryTail`、委托引导 `scanTagAxis`）。
+   *
+   * 缺省派生 `root/dailynote/<bucket>`（本工作区自己的日记本）；`Config.diaryDir`
+   * 非空时**原样**指向外部真源目录（如 VCP 的 `diaries/<bucket>/`）。
+   *
+   * ⚠ 该目录本插件**只读**：`ensureWorkspaceDirs` 不为它建目录，写侧（tools.ts）
+   * 仍落自己的工作区根——外部真源一个字节都不碰。
+   */
+  diaryDir: string
 }
 
-export function workspacePaths(cwd: string, bucketOverride?: string, logFileOverride?: string): WorkspacePaths {
+/** 日记目录解析（**唯一实现**）：显式 override 优先，否则沿用派生。
+ *
+ * 两处调用点（workspacePaths / workspacePathsAtRoot）必须同口径——分散派生
+ * 是这类静默 bug 的温床（override 在一条路径生效、另一条不生效＝同配置两种行为）。 */
+function resolveDiaryDir(root: string, bucket: string, override?: string): string {
+  const o = override?.trim()
+  return o ? o : join(root, 'dailynote', bucket)
+}
+
+export function workspacePaths(
+  cwd: string,
+  bucketOverride?: string,
+  logFileOverride?: string,
+  diaryDirOverride?: string,
+): WorkspacePaths {
   const hash = workspaceHash(cwd)
   const root = join(memoRiverRoot(), hash)
   const bucket = (bucketOverride && bucketOverride.trim()) || basename(cwd) || 'workspace'
@@ -52,6 +76,7 @@ export function workspacePaths(cwd: string, bucketOverride?: string, logFileOver
     pendingDir: join(root, 'pending'),
     logPath: logFileOverride || join(root, 'memo-river.log'),
     bucket,
+    diaryDir: resolveDiaryDir(root, bucket, diaryDirOverride),
   }
 }
 
@@ -59,7 +84,7 @@ export function workspacePaths(cwd: string, bucketOverride?: string, logFileOver
  *
  * 与 workspacePaths 的差别：hash/root 来自解析结果而非从 cwd 推导——跨桶路由只允许
  * 打开注册表里已存在的桶（resolveBucket 保证 hasDb），绝不为陌生桶建目录写 manifest。 */
-export function workspacePathsAtRoot(root: string, bucket: string, cwd?: string): WorkspacePaths {
+export function workspacePathsAtRoot(root: string, bucket: string, cwd?: string, diaryDirOverride?: string): WorkspacePaths {
   return {
     cwd: cwd || root,
     hash: basename(root),
@@ -71,6 +96,7 @@ export function workspacePathsAtRoot(root: string, bucket: string, cwd?: string)
     pendingDir: join(root, 'pending'),
     logPath: join(root, 'memo-river.log'),
     bucket,
+    diaryDir: resolveDiaryDir(root, bucket, diaryDirOverride),
   }
 }
 
