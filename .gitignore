@@ -26,3 +26,10 @@ kernel/tools/diff-report/
 .scratch/t02-baseline/
 .scratch/corpus-governance-0926/07-after-samples-suite*.log
 .scratch/corpus-governance-0926/02-baseline-suite.log
+
+# 编辑器/施工临时备份（2026-10-30 清理，勿跟踪）
+*.bak-*
+*.bak
+*.orig-tmp
+build-tmp/
+panel/test/
