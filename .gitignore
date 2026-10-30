@@ -1,5 +1,7 @@
 node_modules/
 lib/
+# panel/lib 是手写源码（无 src/、无构建脚本），必须提交
+!panel/lib/
 *.tsbuildinfo
 *.tgz
 .selftest/
