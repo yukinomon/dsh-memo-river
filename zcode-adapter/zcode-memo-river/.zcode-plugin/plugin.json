@@ -13,7 +13,6 @@
         "/home/h/dsh-plugins/dsh-memo-river/zcode-adapter/mcp-server.mjs"
       ],
       "env": {
-        "MEMO_RIVER_CWD": "/home/h/dsh-plugins/dsh-memo-river",
         "TAG_EMBED_PROXY": "http://127.0.0.1:7890"
       }
     }
