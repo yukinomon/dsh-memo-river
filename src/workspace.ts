@@ -144,14 +144,23 @@ export class WorkspaceRuntime {
   }
 
   static open(cwd: string, config: Config): WorkspaceRuntime {
-    const paths = workspacePaths(cwd, config.bucket, config.logFile || undefined, config.diaryDir)
+    /* workspaceCwd：把工作区钉到固定 cwd 上（空串=不钉，行为不变）。
+     *
+     * 为什么需要：cwd 只作为桶哈希键（workspaceHash），不是要被打开的目录。宿主升级
+     * 换安装位后 process.cwd() 会变，哈希随之变，插件就去开另一个人烟稀少的空桶——
+     * 语料仍在旧桶里，但注入静默变成空。钉住 cwd 即钉住桶。
+     * 落在 open() 而非 workspacePaths() 内部：后者有别的调用点（injector 的读侧扫描）
+     * 要按会话真实 cwd 取路径，在这里换键会让那两处一起跑偏。 */
+    const pinned = typeof config.workspaceCwd === 'string' ? config.workspaceCwd.trim() : ''
+    const cwdKey = pinned || cwd
+    const paths = workspacePaths(cwdKey, config.bucket, config.logFile || undefined, config.diaryDir)
     ensureWorkspaceDirs(paths)
 
     const resolved = resolveEmbed(config, paths)
     const store = new KnowledgeStore(paths.dbPath)
     const runtime = new WorkspaceRuntime(paths, store, resolved, config)
     runtime.logger.info(
-      `workspace-open cwd=${cwd} hash=${paths.hash} bucket=${paths.bucket} db=${paths.dbPath} embed=${resolved.source} transport=${embedTransportIntent()}`,
+      `workspace-open cwd=${cwdKey}${pinned ? ' (pinned)' : ''} hash=${paths.hash} bucket=${paths.bucket} db=${paths.dbPath} embed=${resolved.source} transport=${embedTransportIntent()}`,
     )
     return runtime
   }

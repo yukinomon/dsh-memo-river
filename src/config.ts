@@ -224,6 +224,14 @@ export interface Config {
    * 草稿 pending）仍落本工作区根，外部目录**只读**。
    */
   diaryDir: string
+  /**
+   * 把工作区钉到固定 cwd 上（空串 = 不钉，取 process.cwd()，行为与旧版一致）。
+   *
+   * cwd 只作桶哈希键，不是被打开的目录。宿主升级换安装位后 process.cwd() 变化会让
+   * 哈希跟着变，插件于是去开一个空桶（原语料仍在旧桶），被动注入静默变空且不报错。
+   * 配成原安装位即可继续读原桶。
+   */
+  workspaceCwd: string
   embed: EmbedConfig
   inject: InjectConfig
   write: WriteConfig
@@ -242,6 +250,8 @@ export const Config: z<Config> = z.object({
   logFile: z.string().default(''),
   // 读侧扫描根覆盖（空串 = 沿用 root/dailynote/<bucket> 派生，默认行为不变）。
   diaryDir: z.string().default(''),
+  // 工作区钉定（空串 = 取 process.cwd()，默认行为不变）。cwd 只是桶哈希键，钉住它就钉住桶。
+  workspaceCwd: z.string().default(''),
   promptChannel: z.union([z.const('section'), z.const('context'), z.const('both')]).default('section'),
 
   embed: z
